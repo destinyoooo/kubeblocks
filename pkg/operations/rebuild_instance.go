@@ -189,6 +189,7 @@ func (r rebuildInstanceOpsHandler) ReconcileAction(reqCtx intctrlutil.RequestCtx
 		expectCount     int
 		completedCount  int
 		failedCount     int
+		deleteRestoreCR bool
 		err             error
 	)
 	if opsRes.OpsRequest.Status.Components == nil {
@@ -201,12 +202,10 @@ func (r rebuildInstanceOpsHandler) ReconcileAction(reqCtx intctrlutil.RequestCtx
 			subFailedCount    int
 		)
 		if v.InPlace {
-			// rebuild instances in place.
 			if subCompletedCount, subFailedCount, err = r.rebuildInstancesInPlace(reqCtx, cli, opsRes, v, &compStatus); err != nil {
 				return opsRequestPhase, 0, err
 			}
 		} else {
-			// rebuild instances with horizontal scaling
 			if subCompletedCount, subFailedCount, err = r.rebuildInstancesWithHScaling(reqCtx, cli, opsRes, v, &compStatus); err != nil {
 				if intctrlutil.IsTargetError(err, intctrlutil.ErrorTypeFatal) {
 					return opsv1alpha1.OpsFailedPhase, 0, err
@@ -218,6 +217,9 @@ func (r rebuildInstanceOpsHandler) ReconcileAction(reqCtx intctrlutil.RequestCtx
 		completedCount += subCompletedCount
 		failedCount += subFailedCount
 		opsRes.OpsRequest.Status.Components[v.ComponentName] = compStatus
+		if v.DeleteRestoreCR != nil && *v.DeleteRestoreCR {
+			deleteRestoreCR = true
+		}
 	}
 	if !reflect.DeepEqual(oldCluster.Spec, opsRes.Cluster.Spec) {
 		if err = cli.Update(reqCtx.Ctx, opsRes.Cluster); err != nil {
@@ -232,7 +234,7 @@ func (r rebuildInstanceOpsHandler) ReconcileAction(reqCtx intctrlutil.RequestCtx
 		return opsRequestPhase, 0, nil
 	}
 	if failedCount == 0 {
-		return opsv1alpha1.OpsSucceedPhase, 0, r.cleanupTmpResources(reqCtx, cli, opsRes)
+		return opsv1alpha1.OpsSucceedPhase, 0, r.cleanupTmpResources(reqCtx, cli, opsRes, deleteRestoreCR)
 	}
 	return opsv1alpha1.OpsFailedPhase, 0, nil
 }
@@ -622,12 +624,25 @@ func (r rebuildInstanceOpsHandler) prepareInplaceRebuildHelper(reqCtx intctrluti
 // cleanupTmpResources clean up the temporary resources generated during the process of rebuilding the instance.
 func (r rebuildInstanceOpsHandler) cleanupTmpResources(reqCtx intctrlutil.RequestCtx,
 	cli client.Client,
-	opsRes *OpsResource) error {
+	opsRes *OpsResource,
+	deleteRestoreCR bool) error {
 	matchLabels := client.MatchingLabels{
 		constant.OpsRequestNameLabelKey:      opsRes.OpsRequest.Name,
 		constant.OpsRequestNamespaceLabelKey: opsRes.OpsRequest.Namespace,
 	}
-	// TODO: need to delete the restore CR?
-	// Pods are limited in k8s, so we need to release them if they are not needed.
-	return intctrlutil.DeleteOwnedResources(reqCtx.Ctx, cli, opsRes.OpsRequest, matchLabels, generics.PodSignature)
+	if err := intctrlutil.DeleteOwnedResources(reqCtx.Ctx, cli, opsRes.OpsRequest, matchLabels, generics.PodSignature); err != nil {
+		return err
+	}
+	if deleteRestoreCR {
+		restoreList := &dpv1alpha1.RestoreList{}
+		if err := cli.List(reqCtx.Ctx, restoreList, matchLabels); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		for _, restore := range restoreList.Items {
+			if err := cli.Delete(reqCtx.Ctx, &restore); err != nil {
+				return client.IgnoreNotFound(err)
+			}
+		}
+	}
+	return nil
 }

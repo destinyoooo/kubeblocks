@@ -283,6 +283,12 @@ type RebuildInstance struct {
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +optional
 	RestoreEnv []corev1.EnvVar `json:"restoreEnv,omitempty" patchStrategy:"merge" patchMergeKey:"name"`
+
+	// Specifies whether to delete the Restore CR after the rebuild instance operation is completed.
+	// If not set, the Restore CR will not be deleted by default.
+	//
+	// +optional
+	DeleteRestoreCR *bool `json:"deleteRestoreCR,omitempty"`
 }
 
 type Instance struct {
