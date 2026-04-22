@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"text/template"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
@@ -35,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	appsv1 "github.com/apecloud/kubeblocks/apis/apps/v1"
 	opsv1alpha1 "github.com/apecloud/kubeblocks/apis/operations/v1alpha1"
 	intctrlutil "github.com/apecloud/kubeblocks/pkg/controllerutil"
 )
@@ -94,7 +94,7 @@ func (r *OpsDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	if err = r.validateOpsDefinitionSpec(reqCtx, opsDef); err != nil {
+	if err = r.validateComponentInfos(reqCtx, opsDef); err != nil {
 		return r.updateStatusUnavailable(reqCtx, opsDef, err)
 	}
 
@@ -127,30 +127,65 @@ func (r *OpsDefinitionReconciler) validateOpsDefinitionSpec(reqCtx intctrlutil.R
 }
 
 func (r *OpsDefinitionReconciler) validateComponentInfos(reqCtx intctrlutil.RequestCtx, opsDef *opsv1alpha1.OpsDefinition) error {
-	for _, compInfo := range opsDef.Spec.ComponentInfos {
-		if compInfo.ComponentDefinitionName == "" {
-			return fmt.Errorf("componentDefinitionName is required in componentInfos")
-		}
+	compDefCache := make(map[string]*appsv1.ComponentDefinition)
 
+	for _, compInfo := range opsDef.Spec.ComponentInfos {
 		if compInfo.ServiceName != "" {
-			svc := &corev1.Service{}
-			if err := r.Client.Get(reqCtx.Ctx, client.ObjectKey{Namespace: opsDef.Namespace, Name: compInfo.ServiceName}, svc); err != nil {
-				return fmt.Errorf("service %s referenced in componentInfos not found: %w", compInfo.ServiceName, err)
+			compDef, err := r.getComponentDefinition(reqCtx, compInfo.ComponentDefinitionName, compDefCache)
+			if err != nil {
+				return fmt.Errorf("failed to get componentDefinition %s: %w", compInfo.ComponentDefinitionName, err)
+			}
+
+			if !r.isServiceNameValid(compDef, compInfo.ServiceName) {
+				return fmt.Errorf("serviceName %s not found in componentDefinition %s services", compInfo.ServiceName, compInfo.ComponentDefinitionName)
 			}
 		}
 
 		for _, imageMapping := range compInfo.ImageMappings {
-			if len(imageMapping.ServiceVersions) == 0 {
-				return fmt.Errorf("serviceVersions is required in imageMappings for component %s", compInfo.ComponentDefinitionName)
+			if err := r.validateImageMappingContainers(opsDef.Spec.Actions, imageMapping, compInfo.ComponentDefinitionName); err != nil {
+				return err
 			}
-			if len(imageMapping.Images) == 0 {
-				return fmt.Errorf("images is required in imageMappings for component %s", compInfo.ComponentDefinitionName)
+		}
+	}
+	return nil
+}
+
+func (r *OpsDefinitionReconciler) getComponentDefinition(reqCtx intctrlutil.RequestCtx, compDefName string, cache map[string]*appsv1.ComponentDefinition) (*appsv1.ComponentDefinition, error) {
+	if compDef, ok := cache[compDefName]; ok {
+		return compDef, nil
+	}
+
+	compDef := &appsv1.ComponentDefinition{}
+	if err := r.Client.Get(reqCtx.Ctx, client.ObjectKey{Name: compDefName}, compDef); err != nil {
+		return nil, err
+	}
+
+	cache[compDefName] = compDef
+	return compDef, nil
+}
+
+func (r *OpsDefinitionReconciler) isServiceNameValid(compDef *appsv1.ComponentDefinition, serviceName string) bool {
+	for _, svc := range compDef.Spec.Services {
+		if svc.Name == serviceName {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *OpsDefinitionReconciler) validateImageMappingContainers(actions []opsv1alpha1.OpsAction, imageMapping opsv1alpha1.ImageMappings, compDefName string) error {
+	allowedContainers := make(map[string]bool)
+	for _, action := range actions {
+		if action.Workload != nil && action.Workload.PodSpec.Containers != nil {
+			for _, container := range action.Workload.PodSpec.Containers {
+				allowedContainers[container.Name] = true
 			}
-			for containerName, image := range imageMapping.Images {
-				if containerName == "" || image == "" {
-					return fmt.Errorf("container name and image must not be empty in imageMappings for component %s", compInfo.ComponentDefinitionName)
-				}
-			}
+		}
+	}
+
+	for containerName := range imageMapping.Images {
+		if !allowedContainers[containerName] {
+			return fmt.Errorf("container %s in imageMappings not found in workload actions for component %s", containerName, compDefName)
 		}
 	}
 	return nil
