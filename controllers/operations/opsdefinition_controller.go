@@ -21,8 +21,10 @@ package operations
 
 import (
 	"context"
+	"fmt"
 	"text/template"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
@@ -91,7 +93,11 @@ func (r *OpsDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return r.updateStatusUnavailable(reqCtx, opsDef, err)
 		}
 	}
-	// TODO: check serviceKind, connectionCredentialName and serviceName
+
+	if err = r.validateOpsDefinitionSpec(reqCtx, opsDef); err != nil {
+		return r.updateStatusUnavailable(reqCtx, opsDef, err)
+	}
+
 	statusPatch := client.MergeFrom(opsDef.DeepCopy())
 	opsDef.Status.ObservedGeneration = opsDef.Generation
 	opsDef.Status.Phase = opsv1alpha1.AvailablePhase
@@ -111,6 +117,43 @@ func (r *OpsDefinitionReconciler) updateStatusUnavailable(reqCtx intctrlutil.Req
 		return intctrlutil.CheckedRequeueWithError(err, reqCtx.Log, "")
 	}
 	return intctrlutil.Reconciled()
+}
+
+func (r *OpsDefinitionReconciler) validateOpsDefinitionSpec(reqCtx intctrlutil.RequestCtx, opsDef *opsv1alpha1.OpsDefinition) error {
+	if err := r.validateComponentInfos(reqCtx, opsDef); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *OpsDefinitionReconciler) validateComponentInfos(reqCtx intctrlutil.RequestCtx, opsDef *opsv1alpha1.OpsDefinition) error {
+	for _, compInfo := range opsDef.Spec.ComponentInfos {
+		if compInfo.ComponentDefinitionName == "" {
+			return fmt.Errorf("componentDefinitionName is required in componentInfos")
+		}
+
+		if compInfo.ServiceName != "" {
+			svc := &corev1.Service{}
+			if err := r.Client.Get(reqCtx.Ctx, client.ObjectKey{Namespace: opsDef.Namespace, Name: compInfo.ServiceName}, svc); err != nil {
+				return fmt.Errorf("service %s referenced in componentInfos not found: %w", compInfo.ServiceName, err)
+			}
+		}
+
+		for _, imageMapping := range compInfo.ImageMappings {
+			if len(imageMapping.ServiceVersions) == 0 {
+				return fmt.Errorf("serviceVersions is required in imageMappings for component %s", compInfo.ComponentDefinitionName)
+			}
+			if len(imageMapping.Images) == 0 {
+				return fmt.Errorf("images is required in imageMappings for component %s", compInfo.ComponentDefinitionName)
+			}
+			for containerName, image := range imageMapping.Images {
+				if containerName == "" || image == "" {
+					return fmt.Errorf("container name and image must not be empty in imageMappings for component %s", compInfo.ComponentDefinitionName)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
